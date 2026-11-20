@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Launch Radar — pre-token protocols ranked by implied value</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead-in">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>Token Launch Radar</h1>
+        <p class="tagline">Protocols that still record no token, ranked by what their launch would be worth.</p>
+      </div>
+    </div>
+    <div class="masthead-stats" id="masthead-stats"></div>
+  </div>
+</header>
+
+<main>
+  <section id="board-view">
+    <div class="controls" role="search">
+      <label class="ctl ctl-grow">Search
+        <input id="q" type="search" placeholder="Protocol name or slug" autocomplete="off">
+      </label>
+      <label class="ctl">Category
+        <select id="f-category"><option value="">All categories</option></select>
+      </label>
+      <label class="ctl">Chain
+        <select id="f-chain"><option value="">All chains</option></select>
+      </label>
+      <label class="ctl">Tier
+        <select id="f-tier">
+          <option value="">All tiers</option>
+          <option value="S">S — $50M+ TVL</option>
+          <option value="A">A — $20–50M</option>
+          <option value="B">B — $10–20M</option>
+          <option value="C">C — $5–10M</option>
+        </select>
+      </label>
+      <label class="ctl ctl-check">
+        <input id="f-watch" type="checkbox"> Watchlist only
+      </label>
+      <span class="ctl-count" id="row-count"></span>
+    </div>
+
+    <div class="table-wrap">
+      <table id="board">
+        <thead>
+          <tr>
+            <th data-sort="rank" class="num">Rank</th>
+            <th data-sort="name">Protocol</th>
+            <th data-sort="category">Category</th>
+            <th data-sort="tvl_usd" class="num">TVL</th>
+            <th data-sort="change_7d" class="num">7d TVL</th>
+            <th data-sort="implied_value_usd" class="num">Implied value</th>
+            <th data-sort="confidence" class="num">Confidence</th>
+            <th data-sort="tier">Tier</th>
+          </tr>
+        </thead>
+        <tbody id="board-body"></tbody>
+      </table>
+      <p class="empty" id="board-empty" hidden>No protocol matches those filters. Loosen one and the radar sweeps again.</p>
+    </div>
+
+    <section class="method" id="method"></section>
+  </section>
+
+  <section id="detail-view" hidden></section>
+</main>
+
+<footer>
+  <p>Implied values are this board's own estimates from the sealed snapshot's figures — what a launch on today's record
+  would be worth if the market priced each protocol like its launched peers. Not a prediction that a token will be
+  issued, and not financial advice. Data: the snapshot named in the header; the page runs fully offline.</p>
+</footer>
+
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
