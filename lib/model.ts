@@ -11,23 +11,36 @@
 //    board and the watchlist speak the same language; the board then goes past the
 //    watchlist's $50M floor down to the snapshot's $5M edge.
 //
-// 2. Comparable ratio. Protocols whose token already trades reveal what the market
-//    pays per dollar of TVL: mcap_usd / tvl_usd. The model takes the median of that
-//    ratio over the candidate's own category (at least 3 peers), else over a family
-//    of like categories, else over every tokenised protocol in the snapshot.
+// 2. The curve. Protocols whose token already trades reveal what the market pays
+//    per dollar of TVL: mcap_usd / tvl_usd. The model fits that multiple against
+//    size by least squares in log space — log(mcap/TVL) = a + b*log(TVL) — over
+//    the snapshot's live-token protocols. The slope is negative: the multiple
+//    falls as TVL grows, which is what the live market actually does. A
+//    candidate's ratio is the curve at its own TVL, and implied = TVL x ratio.
+//    The curve replaces the earlier category-median ratios: held out, the median
+//    model errs by 5.17x while the curve errs by 3.40x (see validateModel).
 //
-// 3. Implied value. implied = TVL x ratio x growth x maturity x breadth, where
-//    growth rewards a rising 7-day TVL (clamped, so one wild week cannot dominate),
-//    maturity rewards a long tokenless track record (listed_at to the snapshot's
-//    as_of), and breadth gives a small premium per extra chain. The figure is an
-//    implied launch market value: what a token issued on today's record would be
-//    worth if the market priced this protocol like its launched peers. It is the
-//    entry's own claim, not a prediction that a token will come.
+// 3. Validation, computed live. validateModel refits the curve with each live
+//    protocol held out once (leave-one-out) and again on the earlier-listed half
+//    tested on the later-listed half (a listing-date split), and reports the
+//    median error factor and the share inside 2x and 3x for each, beside the
+//    category-median baseline on the same test. It also reports the
+//    80th-percentile leave-one-out error factor as range_factor, which each
+//    row carries as a display-only fitted range (implied / factor to implied
+//    x factor). Honest limits: this is one
+//    snapshot date, so neither test is a walk-forward test through time — a
+//    single date cannot show that — and the error is a within-snapshot figure,
+//    not a promise about future launches.
 //
 // 4. Farm plan. Each candidate gets a concrete plan generated from its category
 //    family, its main chain and its size band: the core position to open, the
 //    weekly rhythm to keep, the governance and community work, and the snapshot
 //    hygiene to hold, each step with a cost and a time budget.
+//
+// The 7-day momentum, track record and chain breadth are shown on every row as
+// context, and are NOT multiplied into the value: held out, multiplying them in
+// made the curve's error worse (3.40x alone, 3.56x with them), so the value is
+// the curve alone and the factors stay visible as facts about the protocol.
 
 export interface Protocol {
   slug: string;
@@ -55,6 +68,10 @@ export interface BoardRow {
   name: string;
   rank: number;
   implied_value_usd: number;
+  // Fitted range, display-only: implied value divided / multiplied by the
+  // 80th-percentile leave-one-out error factor. Never changes the ranking.
+  implied_low: number;
+  implied_high: number;
   farm_steps: string[];
   category: string | null;
   chains: string[];
@@ -68,18 +85,64 @@ export interface BoardRow {
   ratio: number;
   ratio_basis: string;
   peer_count: number;
+  extrapolated: boolean;
+  // Context only: shown beside the row, never multiplied into implied value.
   growth_factor: number;
   maturity_factor: number;
   breadth_factor: number;
 }
 
-export interface ModelParams {
-  version: string;
-  global_ratio: number;
-  min_category_peers: number;
+/** The fitted log-log curve: log(mcap/TVL) = a + b*log(TVL). */
+export interface CurveFit {
+  a: number;
+  b: number;
+  n: number;
+  tvl_min_usd: number;
+  tvl_max_usd: number;
 }
 
-export const MODEL_VERSION = 'comparables-v1';
+/** One held-out test: median error factor and the shares inside 2x and 3x. */
+export interface ValidationSplit {
+  n: number;
+  median_factor: number;
+  within_2x_pct: number;
+  within_3x_pct: number;
+}
+
+/** The listing-date split: fitted on the earlier-listed half, tested on the later. */
+export interface TimeSplitValidation extends ValidationSplit {
+  train_n: number;
+  cutoff: string;
+}
+
+/** The model's held-out validation, computed live from the snapshot. */
+export interface Validation {
+  loo: ValidationSplit;
+  time_split: TimeSplitValidation;
+  baseline_median_loo: ValidationSplit;
+  /** 80th-percentile leave-one-out error factor: exp of the 80th-percentile
+   *  absolute log error across the held-out protocols. Each row's fitted
+   *  range is implied / range_factor to implied * range_factor. */
+  range_factor: number;
+  note: string;
+}
+
+/** The board's headline numbers, computed live from the rows. */
+export interface BoardKpis {
+  candidates: number;
+  watchlist_covered: number;
+  watchlist_size: number;
+  median_ratio: number;
+  top_implied_usd: number;
+  total_implied_usd: number;
+  median_implied_usd: number;
+}
+
+export interface ModelParams {
+  version: string;
+}
+
+export const MODEL_VERSION = 'curve-v1';
 
 // Categories that are products of another protocol's token, never a launch of
 // their own (the house watchlist rule, reused for the whole board).
@@ -97,7 +160,8 @@ const PRODUCT_NAME_WORDS = /\b(wrapped|staked|staking)\b/i;
 const VERSION_SUFFIX = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
 // Category families: categories close enough to share a comparable ratio when a
-// category has too few launched peers of its own.
+// category has too few launched peers of its own. Used by the farm plan's voice
+// and by the validation baseline, never by the curve itself.
 const FAMILIES: Record<string, string> = {
   'Lending': 'credit',
   'CDP': 'credit',
@@ -150,64 +214,60 @@ function median(values: number[]): number {
   return (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
-export interface RatioBook {
-  globalRatio: number;
-  byCategory: Map<string, { ratio: number; peers: number }>;
-  byFamily: Map<string, { ratio: number; peers: number }>;
+/** Nearest-rank percentile (p in 0..1): the value at rank ceil(p * n). */
+function percentile(values: number[], p: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1));
+  return sorted[idx]!;
 }
 
-/** Medians of mcap/TVL over the snapshot's launched protocols. */
-export function buildRatioBook(snapshot: Snapshot): RatioBook {
-  const catValues = new Map<string, number[]>();
-  const famValues = new Map<string, number[]>();
-  const all: number[] = [];
-  for (const p of snapshot.protocols) {
-    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
-    if (recordsNoToken(p)) continue; // peers are launched protocols: they record a token
-    const ratio = p.mcap_usd / p.tvl_usd;
-    all.push(ratio);
-    if (p.category !== null) {
-      const list = catValues.get(p.category) ?? [];
-      list.push(ratio);
-      catValues.set(p.category, list);
-    }
-    const fam = familyOf(p.category);
-    const flist = famValues.get(fam) ?? [];
-    flist.push(ratio);
-    famValues.set(fam, flist);
-  }
-  const byCategory = new Map<string, { ratio: number; peers: number }>();
-  for (const [cat, values] of catValues) byCategory.set(cat, { ratio: median(values), peers: values.length });
-  const byFamily = new Map<string, { ratio: number; peers: number }>();
-  for (const [fam, values] of famValues) byFamily.set(fam, { ratio: median(values), peers: values.length });
-  return { globalRatio: median(all), byCategory, byFamily };
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
-const MIN_PEERS = 3;
+function round1(value: number): number {
+  return Math.round(value * 10) / 10;
+}
 
-/** The comparable ratio for a candidate, and where it came from. */
-export function ratioFor(book: RatioBook, category: string | null): { ratio: number; basis: string; peers: number } {
-  if (category !== null) {
-    const own = book.byCategory.get(category);
-    if (own !== undefined && own.peers >= MIN_PEERS) {
-      return { ratio: own.ratio, basis: `category median of ${own.peers} launched ${category} protocols`, peers: own.peers };
-    }
+/** The live-token protocols: a market cap and a TVL, both positive. */
+export function liveProtocols(protocols: Protocol[]): Protocol[] {
+  return protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+}
+
+/**
+ * Fit log(mcap/TVL) = a + b*log(TVL) by ordinary least squares over the
+ * live-token protocols. The slope is expected negative: the market pays a
+ * smaller multiple per TVL dollar as a protocol gets bigger.
+ */
+export function fitCurve(live: Protocol[]): CurveFit {
+  const xs = live.map((p) => Math.log(p.tvl_usd));
+  const ys = live.map((p) => Math.log(p.mcap_usd! / p.tvl_usd));
+  const n = live.length;
+  const meanX = xs.reduce((s, x) => s + x, 0) / n;
+  const meanY = ys.reduce((s, y) => s + y, 0) / n;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (xs[i]! - meanX) * (ys[i]! - meanY);
+    den += (xs[i]! - meanX) ** 2;
   }
-  const fam = familyOf(category);
-  const famEntry = book.byFamily.get(fam);
-  if (famEntry !== undefined && famEntry.peers >= MIN_PEERS && fam !== 'core') {
-    return { ratio: famEntry.ratio, basis: `${fam} family median of ${famEntry.peers} launched protocols`, peers: famEntry.peers };
-  }
-  const core = book.byFamily.get('core');
-  const peers = core !== undefined ? core.peers : 0;
-  return { ratio: book.globalRatio, basis: `global median of all launched protocols in the snapshot`, peers };
+  const b = den === 0 ? 0 : num / den;
+  const a = meanY - b * meanX;
+  const tvls = live.map((p) => p.tvl_usd);
+  return { a, b, n, tvl_min_usd: Math.min(...tvls), tvl_max_usd: Math.max(...tvls) };
+}
+
+/** The curve's multiple at one TVL: exp(a + b*ln(TVL)). */
+export function curveRatio(curve: CurveFit, tvl: number): number {
+  return Math.exp(curve.a + curve.b * Math.log(tvl));
 }
 
 function clamp(value: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, value));
 }
 
-/** Momentum: a rising week helps, a falling week hurts, both clamped hard. */
+/** Momentum, shown as context: a rising week helps, a falling week hurts, both clamped hard. */
 export function growthFactor(change7d: number | null): number {
   if (change7d === null) return 1;
   const pct = clamp(change7d, -60, 150);
@@ -223,44 +283,54 @@ export function ageDays(listedAt: string | null, asOf: string): number | null {
   return Math.max(0, Math.round((end - start) / 86_400_000));
 }
 
-/** Track record: the longer a protocol has run tokenless, the fuller the factor. */
+/** Track record, shown as context: the longer a protocol has run tokenless, the fuller the factor. */
 export function maturityFactor(age: number | null): number {
   if (age === null) return 0.95;
   const years = age / 365.25;
   return 0.85 + 0.075 * Math.min(years, 3);
 }
 
-/** A small premium for each extra chain the protocol already runs on. */
+/** Chain breadth, shown as context: a small premium for each extra chain the protocol already runs on. */
 export function breadthFactor(chainCount: number): number {
   return 1 + 0.02 * Math.min(Math.max(chainCount - 1, 0), 5);
 }
 
-/** The implied launch value of one candidate, in whole dollars. */
+/**
+ * The implied launch value of one candidate, in whole dollars: TVL x the curve
+ * ratio, and nothing else. The growth, maturity and breadth factors are computed
+ * and returned as context, but they are NOT multiplied in — held out, doing so
+ * made the curve's error worse (3.40x alone, 3.56x with them).
+ */
 export function impliedValue(p: Protocol, ratio: number, asOf: string): { value: number; growth: number; maturity: number; breadth: number; age: number | null } {
   const growth = growthFactor(p.change_7d);
   const age = ageDays(p.listed_at, asOf);
   const maturity = maturityFactor(age);
   const breadth = breadthFactor(p.chains.length);
-  const raw = p.tvl_usd * ratio * growth * maturity * breadth;
+  const raw = p.tvl_usd * ratio;
   return { value: Math.max(1, Math.round(raw)), growth, maturity, breadth, age };
 }
 
-/** Confidence 0-100: how much evidence stands behind this row's number. */
-export function confidenceScore(peers: number, basis: string, age: number | null, tvl: number, change7d: number | null): number {
-  let score = 40;
-  if (basis.startsWith('category')) score += peers >= 8 ? 20 : 12;
-  else if (basis.startsWith('global')) score += 2;
-  else score += 8;
-  if (age === null) score += 2;
-  else if (age >= 730) score += 15;
-  else if (age >= 365) score += 8;
+/**
+ * Confidence 0-100: how much evidence stands behind this row's number. A curve
+ * fitted on the snapshot's live-token protocols is real evidence; a TVL inside
+ * the fitted range is worth more than an extrapolation past it; a long tokenless
+ * track record, a large TVL and a calm 7-day move each add a little.
+ */
+export function confidenceScore(curve: CurveFit, extrapolated: boolean, age: number | null, tvl: number, change7d: number | null): number {
+  // The base is the fit itself: a curve fitted on curve.n live-token protocols
+  // is real evidence, and the more protocols it was fitted on, the more.
+  let score = 45 + Math.min(12, Math.floor(curve.n / 12));
+  if (!extrapolated) score += 10;
+  if (age === null) score += 1;
+  else if (age >= 730) score += 12;
+  else if (age >= 365) score += 7;
   else if (age >= 90) score += 3;
-  if (tvl >= 50_000_000) score += 10;
-  else if (tvl >= 20_000_000) score += 6;
-  else if (tvl >= 10_000_000) score += 3;
-  if (change7d === null) score += 4;
-  else if (change7d >= -10 && change7d <= 25) score += 8;
-  else if (change7d >= -30 && change7d <= 60) score += 4;
+  if (tvl >= 50_000_000) score += 8;
+  else if (tvl >= 20_000_000) score += 5;
+  else if (tvl >= 10_000_000) score += 2;
+  if (change7d === null) score += 3;
+  else if (change7d >= -10 && change7d <= 25) score += 6;
+  else if (change7d >= -30 && change7d <= 60) score += 3;
   else score += 1;
   return Math.min(97, score);
 }
@@ -351,20 +421,109 @@ export function farmPlan(p: Protocol): string[] {
   ];
 }
 
+// ---------------------------------------------------------------- validation
+
+function errorFactor(predicted: number, actual: number): number {
+  return Math.max(predicted / actual, actual / predicted);
+}
+
+function summarise(factors: number[]): ValidationSplit {
+  const n = factors.length;
+  if (n === 0) return { n: 0, median_factor: 0, within_2x_pct: 0, within_3x_pct: 0 };
+  return {
+    n,
+    median_factor: round2(median(factors)),
+    within_2x_pct: round1((factors.filter((f) => f <= 2).length / n) * 100),
+    within_3x_pct: round1((factors.filter((f) => f <= 3).length / n) * 100),
+  };
+}
+
+/** The category-median ratio for one protocol, itself excluded: the baseline the curve must beat. */
+function medianRatioExcluding(live: Protocol[], self: Protocol): number {
+  const catPeers = live
+    .filter((q) => q.slug !== self.slug && q.category !== null && q.category === self.category)
+    .map((q) => q.mcap_usd! / q.tvl_usd);
+  if (catPeers.length >= 3) return median(catPeers);
+  const fam = familyOf(self.category);
+  if (fam !== 'core') {
+    const famPeers = live
+      .filter((q) => q.slug !== self.slug && familyOf(q.category) === fam)
+      .map((q) => q.mcap_usd! / q.tvl_usd);
+    if (famPeers.length >= 3) return median(famPeers);
+  }
+  return median(live.filter((q) => q.slug !== self.slug).map((q) => q.mcap_usd! / q.tvl_usd));
+}
+
+/**
+ * The model's held-out validation, computed live from the snapshot:
+ * leave-one-out (refit the curve with each live protocol held out once),
+ * a listing-date split (fit on the earlier-listed half, test on the later),
+ * and the category-median baseline on the same leave-one-out test.
+ */
+export function validateModel(live: Protocol[]): Validation {
+  const looFactors: number[] = [];
+  for (const held of live) {
+    const train = live.filter((q) => q.slug !== held.slug);
+    const curve = fitCurve(train);
+    looFactors.push(errorFactor(held.tvl_usd * curveRatio(curve, held.tvl_usd), held.mcap_usd!));
+  }
+
+  const dated = live
+    .filter((p) => p.listed_at !== null)
+    .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : 0));
+  let timeSplit: TimeSplitValidation = { n: 0, train_n: 0, cutoff: '', median_factor: 0, within_2x_pct: 0, within_3x_pct: 0 };
+  if (dated.length >= 4) {
+    const cutoff = dated[Math.floor(dated.length / 2)]!.listed_at!;
+    const train = dated.filter((p) => p.listed_at! < cutoff);
+    const test = dated.filter((p) => p.listed_at! >= cutoff);
+    if (train.length > 0 && test.length > 0) {
+      const curve = fitCurve(train);
+      const factors = test.map((p) => errorFactor(p.tvl_usd * curveRatio(curve, p.tvl_usd), p.mcap_usd!));
+      timeSplit = { ...summarise(factors), train_n: train.length, cutoff };
+    }
+  }
+
+  const baselineFactors = live.map((p) => errorFactor(p.tvl_usd * medianRatioExcluding(live, p), p.mcap_usd!));
+
+  // The fitted range factor: the 80th-percentile leave-one-out error factor.
+  // Each loo factor is exp(|log error|) for one held-out protocol, so the
+  // 80th percentile of the factors is exp of the 80th-percentile absolute
+  // log error — the factor 80% of held-out launches stayed inside.
+  const rangeFactor = round2(percentile(looFactors, 0.8));
+
+  return {
+    loo: summarise(looFactors),
+    time_split: timeSplit,
+    baseline_median_loo: summarise(baselineFactors),
+    range_factor: rangeFactor,
+    note:
+      'Held out on one snapshot date: leave-one-out refits the curve once per live protocol, and the ' +
+      'time split fits on the earlier-listed half and tests on the later half. Neither is a walk-forward ' +
+      'test through time — a single snapshot cannot show that — so the error is a within-snapshot figure, ' +
+      'not a promise about future launches.',
+  };
+}
+
 /** Build the whole ranked board from the snapshot. */
-export function buildBoard(snapshot: Snapshot): { rows: BoardRow[]; params: ModelParams } {
-  const book = buildRatioBook(snapshot);
+export function buildBoard(snapshot: Snapshot): { rows: BoardRow[]; params: ModelParams; curve: CurveFit; validation: Validation; kpis: BoardKpis } {
+  const live = liveProtocols(snapshot.protocols);
+  const curve = fitCurve(live);
+  const validation = validateModel(live);
+  const rangeFactor = validation.range_factor > 0 ? validation.range_factor : 1;
   const watchlist = new Set(snapshot.watchlist);
   const rows: BoardRow[] = [];
   for (const p of snapshot.protocols) {
     if (!isCandidate(p)) continue;
-    const r = ratioFor(book, p.category);
-    const iv = impliedValue(p, r.ratio, snapshot.as_of);
+    const ratio = curveRatio(curve, p.tvl_usd);
+    const iv = impliedValue(p, ratio, snapshot.as_of);
+    const extrapolated = p.tvl_usd < curve.tvl_min_usd || p.tvl_usd > curve.tvl_max_usd;
     rows.push({
       slug: p.slug,
       name: p.name,
       rank: 0,
       implied_value_usd: iv.value,
+      implied_low: Math.max(1, Math.round(iv.value / rangeFactor)),
+      implied_high: Math.round(iv.value * rangeFactor),
       farm_steps: farmPlan(p),
       category: p.category,
       chains: p.chains,
@@ -374,10 +533,11 @@ export function buildBoard(snapshot: Snapshot): { rows: BoardRow[]; params: Mode
       age_days: iv.age,
       in_watchlist: watchlist.has(p.slug),
       tier: tierOf(p.tvl_usd),
-      confidence: confidenceScore(r.peers, r.basis, iv.age, p.tvl_usd, p.change_7d),
-      ratio: r.ratio,
-      ratio_basis: r.basis,
-      peer_count: r.peers,
+      confidence: confidenceScore(curve, extrapolated, iv.age, p.tvl_usd, p.change_7d),
+      ratio,
+      ratio_basis: `log-log curve fit on ${curve.n} live-token protocols`,
+      peer_count: curve.n,
+      extrapolated,
       growth_factor: iv.growth,
       maturity_factor: iv.maturity,
       breadth_factor: iv.breadth,
@@ -387,7 +547,16 @@ export function buildBoard(snapshot: Snapshot): { rows: BoardRow[]; params: Mode
   rows.forEach((row, i) => {
     row.rank = i + 1;
   });
-  return { rows, params: { version: MODEL_VERSION, global_ratio: book.globalRatio, min_category_peers: MIN_PEERS } };
+  const kpis: BoardKpis = {
+    candidates: rows.length,
+    watchlist_covered: rows.filter((r) => r.in_watchlist).length,
+    watchlist_size: snapshot.watchlist.length,
+    median_ratio: median(live.map((p) => p.mcap_usd! / p.tvl_usd)),
+    top_implied_usd: rows[0]?.implied_value_usd ?? 0,
+    total_implied_usd: rows.reduce((sum, r) => sum + r.implied_value_usd, 0),
+    median_implied_usd: rows.length > 0 ? median(rows.map((r) => r.implied_value_usd)) : 0,
+  };
+  return { rows, params: { version: MODEL_VERSION }, curve, validation, kpis };
 }
 
 /** The first gate problem with a board, or null when it is shaped right. */
