@@ -196,6 +196,27 @@ ol.steps li::marker { color: var(--signal); font-family: var(--mono); }
 
 footer { max-width: 1180px; margin: 0 auto; padding: 6px 20px 30px; color: var(--ink-faint); font-size: 13px; }
 
+/* Validation panel — same panel language as .method */
+.validation {
+  margin-top: 18px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 18px;
+  color: var(--ink-dim);
+  font-size: 14px;
+}
+.validation h2 { margin: 0 0 8px; font-size: 16px; color: var(--ink); }
+.validation code { font-family: var(--mono); color: var(--signal); font-size: 13px; }
+.val-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 12px 0; }
+.val-fact { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.val-fact span { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink-faint); }
+.val-fact b { font-family: var(--mono); font-size: 17px; font-weight: 600; color: var(--signal); }
+.val-fact small { display: block; font-size: 12px; color: var(--ink-dim); margin-top: 3px; }
+.validation .limit { border-left: 3px solid var(--amber); padding: 2px 0 2px 12px; }
+td.ratio { color: var(--ink-dim); }
+.extrap { color: var(--amber); font-size: 13px; }
+
 @media (max-width: 760px) {
   .detail-value { text-align: left; }
   th.hide-s, td.hide-s { display: none; }

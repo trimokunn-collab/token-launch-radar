@@ -56,6 +56,7 @@
             <th data-sort="category">Category</th>
             <th data-sort="tvl_usd" class="num">TVL</th>
             <th data-sort="change_7d" class="num">7d TVL</th>
+            <th data-sort="ratio" class="num">Curve ratio</th>
             <th data-sort="implied_value_usd" class="num">Implied value</th>
             <th data-sort="confidence" class="num">Confidence</th>
             <th data-sort="tier">Tier</th>
@@ -67,15 +68,18 @@
     </div>
 
     <section class="method" id="method"></section>
+
+    <section class="validation" id="validation"></section>
   </section>
 
   <section id="detail-view" hidden></section>
 </main>
 
 <footer>
-  <p>Implied values are this board's own estimates from the sealed snapshot's figures — what a launch on today's record
-  would be worth if the market priced each protocol like its launched peers. Not a prediction that a token will be
-  issued, and not financial advice. Data: the snapshot named in the header; the page runs fully offline.</p>
+  <p>Implied values come from one fitted curve (see the validation panel) — what a launch on today's record
+  would be worth if the market priced each protocol the way it prices launched protocols of the same size.
+  Momentum, track record and chain breadth are shown for context only and never enter a value. Not a prediction
+  that a token will be issued, and not financial advice. Data: the snapshot named in the header; the page runs fully offline.</p>
 </footer>
 
 <script src="../data.js"></script>

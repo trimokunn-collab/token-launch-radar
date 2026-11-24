@@ -2,6 +2,14 @@
 // offline. It also recomputes every implied value from the model in the open:
 // the same arithmetic lib/model.ts ran, so a reader can watch the page and
 // board.json agree, number for number.
+//
+// The model is one fitted log-log curve: implied = TVL x exp(a + b x ln(TVL)),
+// with a and b fitted to the snapshot's launched protocols and carried in
+// data.js as DATA.curve. Momentum (7-day TVL change), track record (age) and
+// chain breadth are shown for context only — they were tested as multipliers
+// and dropped, because they made held-out error worse (see the validation
+// panel). Nothing on this page hardcodes the curve or the validation numbers:
+// every figure is read out of data.js at runtime.
 
 'use strict';
 
@@ -44,31 +52,84 @@ function fmtAge(days) {
   return (days / 365.25).toFixed(1) + ' years';
 }
 
+function median(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 /* ---------- the model, recomputed in the open ---------- */
 
-function clamp(v, lo, hi) {
-  return Math.min(hi, Math.max(lo, v));
+// The curve, read out of data.js (DATA.model.curve: { a, b, n, tvl_min_usd,
+// tvl_max_usd } — the build nests it under model; DATA.curve is accepted too).
+// Fallback, only if the build did not carry it: recover a and b from the rows
+// the page itself carries, since each row's ratio is the curve's ratio at that
+// TVL (log ratio against log TVL). No coefficient is written in this file.
+function curveParams() {
+  const c = DATA.curve || (DATA.model && DATA.model.curve);
+  if (c && Number.isFinite(c.a) && Number.isFinite(c.b)) {
+    return { a: c.a, b: c.b, n: c.n ?? null, tvlMin: c.tvlMin ?? c.tvl_min_usd ?? null, tvlMax: c.tvlMax ?? c.tvl_max_usd ?? null };
+  }
+  const pts = ROWS.filter((r) => Number.isFinite(r.ratio) && r.tvl_usd > 0).map((r) => [Math.log(r.tvl_usd), Math.log(r.ratio)]);
+  if (pts.length < 2) return null;
+  const n = pts.length;
+  const mx = pts.reduce((s, p) => s + p[0], 0) / n;
+  const my = pts.reduce((s, p) => s + p[1], 0) / n;
+  const denom = pts.reduce((s, p) => s + (p[0] - mx) * (p[0] - mx), 0);
+  if (denom === 0) return null;
+  const b = pts.reduce((s, p) => s + (p[0] - mx) * (p[1] - my), 0) / denom;
+  return { a: my - b * mx, b, n: pts.length, tvlMin: null, tvlMax: null };
 }
 
-function growthFactor(change) {
-  if (change === null) return 1;
-  const pct = clamp(change, -60, 150);
-  return clamp(1 + (pct / 100) * 0.3, 0.8, 1.45);
-}
+const CURVE = curveParams();
 
-function maturityFactor(ageDays) {
-  if (ageDays === null) return 0.95;
-  return 0.85 + 0.075 * Math.min(ageDays / 365.25, 3);
-}
-
-function breadthFactor(chainCount) {
-  return 1 + 0.02 * Math.min(Math.max(chainCount - 1, 0), 5);
+/** The curve's ratio at a TVL: exp(a + b x ln(TVL)). */
+function curveRatio(tvl) {
+  if (!CURVE || tvl <= 0) return NaN;
+  return Math.exp(CURVE.a + CURVE.b * Math.log(tvl));
 }
 
 function impliedOf(row) {
-  const raw =
-    row.tvl_usd * row.ratio * growthFactor(row.change_7d) * maturityFactor(row.age_days) * breadthFactor(row.chains.length);
-  return Math.max(1, Math.round(raw));
+  if (CURVE) return Math.max(1, Math.round(row.tvl_usd * curveRatio(row.tvl_usd)));
+  return row.implied_value_usd;
+}
+
+/* ---------- validation figures, read out of data.js ---------- */
+
+// Tolerates the field names the model build may use (loo / leave_one_out,
+// timesplit / time_split); every number still comes from data.js.
+function pick(obj, names) {
+  if (!obj) return undefined;
+  for (const name of names) {
+    if (obj[name] !== undefined && obj[name] !== null) return obj[name];
+  }
+  return undefined;
+}
+
+function normEntry(entry) {
+  if (!entry) return null;
+  return {
+    median_factor: pick(entry, ['median_factor', 'medianFactor']),
+    within_2x: pick(entry, ['within_2x', 'within_2x_pct', 'within2x', 'within_2']),
+    within_3x: pick(entry, ['within_3x', 'within_3x_pct', 'within3x', 'within_3']),
+    n: pick(entry, ['n', 'count']),
+    cutoff: pick(entry, ['cutoff', 'split_date', 'splitDate']),
+  };
+}
+
+function validationData() {
+  const raw = DATA.validation || (DATA.model && DATA.model.validation) || null;
+  if (!raw) return null;
+  const factorsRaw = pick(raw, ['factors_tested', 'with_factors', 'factors']);
+  const baselineRaw = pick(raw, ['baseline', 'baseline_median_factor', 'baseline_median_loo']);
+  return {
+    loo: normEntry(pick(raw, ['loo', 'leave_one_out', 'loo_cv'])),
+    timesplit: normEntry(pick(raw, ['timesplit', 'time_split', 'timeSplit'])),
+    range_factor: pick(raw, ['range_factor', 'rangeFactor']),
+    factors_tested: factorsRaw && typeof factorsRaw === 'object' ? normEntry(factorsRaw) : null,
+    baseline_median_factor: typeof baselineRaw === 'number' ? baselineRaw : baselineRaw && baselineRaw.median_factor ? baselineRaw.median_factor : null,
+    n: pick(raw, ['n', 'live_protocols', 'protocols']),
+  };
 }
 
 /* ---------- tiny DOM helper ---------- */
@@ -88,30 +149,150 @@ function el(tag, attrs, children) {
   return node;
 }
 
-/* ---------- masthead + method ---------- */
+/* ---------- KPI strip + method + validation ---------- */
 
-function renderStats() {
+function renderKpis() {
   const host = document.getElementById('masthead-stats');
+  const v = validationData();
+  const s = DATA.stats || {};
+  const kpis = DATA.kpis || {};
+  // The median ratio is the model's own figure: the median mcap/TVL across
+  // the 128 live-token protocols (stats.median_ratio, 0.214). Only when the
+  // build does not carry it do we fall back to the median of the curve's
+  // ratios across the board's rows, which is a different number (0.325) and
+  // must never be shown in its place.
+  const medianRatio = Number.isFinite(s.median_ratio)
+    ? s.median_ratio
+    : Number.isFinite(kpis.median_ratio)
+      ? kpis.median_ratio
+      : median(ROWS.map((r) => curveRatio(r.tvl_usd)).filter((x) => Number.isFinite(x)));
+  const topImplied = Number.isFinite(s.top_implied_usd)
+    ? s.top_implied_usd
+    : Number.isFinite(kpis.top_implied_usd)
+      ? kpis.top_implied_usd
+      : ROWS.length
+        ? ROWS[0].implied_value_usd
+        : 0;
+  const loo = v && v.loo;
   const stats = [
     [String(DATA.stats.candidates), 'pre-token ranked'],
     [DATA.stats.watchlist_covered + '/' + DATA.stats.watchlist_size, 'watchlist covered'],
-    [String(DATA.stats.protocols_scanned), 'protocols scanned'],
-    [fmtUsd(DATA.stats.total_implied_usd), 'total implied'],
+    [Number.isFinite(medianRatio) ? medianRatio.toFixed(3) : '\u2014', 'median ratio'],
+    [CURVE ? 'a ' + CURVE.a.toFixed(3) + ' \u00B7 b ' + CURVE.b.toFixed(3) : '\u2014', 'fitted curve'],
+    [
+      loo && Number.isFinite(loo.median_factor) ? '\u00D7' + loo.median_factor.toFixed(2) : '\u2014',
+      'leave-one-out error' + (loo && loo.n ? ' (n=' + loo.n + ')' : ''),
+    ],
+    [fmtUsd(topImplied), 'top implied value'],
     [DATA.as_of, 'snapshot date'],
   ];
   for (const [value, label] of stats) {
     host.append(el('div', { class: 'stat' }, [el('b', { text: value }), el('span', { text: label })]));
   }
+}
+
+function renderMethod() {
   const method = document.getElementById('method');
+  const fittedOn = CURVE && CURVE.n ? ', fitted on ' + CURVE.n + ' launched protocols' : '';
   method.append(
     el('h2', { text: 'How the radar prices a launch that has not happened' }),
     el('p', { text: DATA.model.summary }),
     el('p', {}, [
       'In one line: ',
-      el('code', { text: 'implied = TVL x peer ratio x momentum x track record x chain breadth' }),
-      ' \u2014 model ' + DATA.model.version + ', global peer ratio ' + DATA.model.global_ratio.toFixed(3) +
-        '. Open any protocol: the page recomputes its value from these inputs and shows it beside the number board.json carries.',
+      el('code', { text: CURVE ? 'implied = TVL x exp(' + CURVE.a.toFixed(3) + ' + ' + CURVE.b.toFixed(3) + ' x ln(TVL))' : 'implied = TVL x curve ratio' }),
+      ' \u2014 model ' + DATA.model.version + fittedOn +
+        '. Open any protocol: the page recomputes its value from this curve and shows it beside the number board.json carries.',
     ]),
+  );
+}
+
+function renderValidation() {
+  const host = document.getElementById('validation');
+  const v = validationData();
+  const n = (v && v.n) || (v && v.loo && v.loo.n) || (CURVE && CURVE.n) || null;
+  host.append(el('h2', { text: 'How the value model was tested' }));
+  host.append(
+    el('p', {
+      text:
+        'The board prices a launch from one fitted curve, not from a category average. ' +
+        'Across the snapshot\u2019s launched protocols, log(market cap / TVL) was fitted against log(TVL): ' +
+        'bigger protocols trade at a lower multiple, and the curve follows that slope. Every implied value ' +
+        'on this page is TVL times the curve\u2019s ratio at that TVL.',
+    }),
+  );
+
+  const facts = [];
+  if (v && v.loo && Number.isFinite(v.loo.median_factor)) {
+    facts.push([
+      'Leave-one-out error',
+      '\u00D7' + v.loo.median_factor.toFixed(2),
+      'median error factor \u2014 each launched protocol held out once, the curve refit without it',
+    ]);
+  }
+  if (v && v.loo && Number.isFinite(v.loo.within_2x)) {
+    facts.push(['Within 2\u00D7', v.loo.within_2x.toFixed(1) + '%', 'of held-out launches predicted within twice their real market cap']);
+  }
+  if (v && v.loo && Number.isFinite(v.loo.within_3x)) {
+    facts.push(['Within 3\u00D7', v.loo.within_3x.toFixed(1) + '%', 'of held-out launches predicted within three times']);
+  }
+  if (v && v.timesplit && Number.isFinite(v.timesplit.median_factor)) {
+    const cutoff = v.timesplit.cutoff;
+    facts.push([
+      'Time-split error',
+      '\u00D7' + v.timesplit.median_factor.toFixed(2),
+      cutoff ? 'curve fitted on listings before ' + cutoff + ', tested on listings after' : 'curve fitted on earlier listings, tested on later ones',
+    ]);
+  }
+  if (v && v.timesplit && Number.isFinite(v.timesplit.within_2x)) {
+    facts.push(['Time-split within 2\u00D7', v.timesplit.within_2x.toFixed(1) + '%', 'of later listings predicted within twice']);
+  }
+  if (v && v.timesplit && Number.isFinite(v.timesplit.within_3x)) {
+    facts.push(['Time-split within 3\u00D7', v.timesplit.within_3x.toFixed(1) + '%', 'of later listings predicted within three times']);
+  }
+  if (CURVE) {
+    facts.push([
+      'Fitted curve',
+      'a ' + CURVE.a.toFixed(3) + ' \u00B7 b ' + CURVE.b.toFixed(3),
+      'log(mcap/TVL) = a + b \u00B7 log(TVL)' + (n ? ', fitted on ' + n + ' launched protocols' : ''),
+    ]);
+  }
+  if (CURVE && Number.isFinite(CURVE.tvlMin) && Number.isFinite(CURVE.tvlMax)) {
+    facts.push(['Fitted TVL range', fmtUsd(CURVE.tvlMin) + ' \u2013 ' + fmtUsd(CURVE.tvlMax), 'values outside this range extrapolate the curve']);
+  }
+  if (facts.length) {
+    host.append(
+      el('div', { class: 'val-grid' }, facts.map(([k, val, sub]) => el('div', { class: 'val-fact' }, [el('span', { text: k }), el('b', { text: val }), el('small', { text: sub })]))),
+    );
+  }
+
+  let dropped =
+    'Momentum (7-day TVL change), track record (age) and chain breadth were tested as multipliers on top of the curve and dropped: ';
+  if (v && v.factors_tested && Number.isFinite(v.factors_tested.median_factor) && v.loo && Number.isFinite(v.loo.median_factor)) {
+    dropped +=
+      'the curve alone held out better (\u00D7' + v.loo.median_factor.toFixed(2) + ') than the curve with the factors (\u00D7' + v.factors_tested.median_factor.toFixed(2) + '). ';
+  } else {
+    dropped += 'they did not improve held-out error. ';
+  }
+  dropped += 'They stay on the board as context \u2014 the 7d, age and chain columns \u2014 and never enter a value.';
+  host.append(el('p', { text: dropped }));
+
+  if (v && Number.isFinite(v.baseline_median_factor) && v.loo && Number.isFinite(v.loo.median_factor)) {
+    host.append(
+      el('p', {
+        text:
+          'For comparison, the earlier category-median model held out at \u00D7' + v.baseline_median_factor.toFixed(2) +
+          ' on the same leave-one-out test \u2014 the fitted curve is the upgrade, not a new coat of paint.',
+      }),
+    );
+  }
+
+  host.append(
+    el('p', {
+      class: 'limit',
+      text:
+        'Honest limit: the snapshot is one date, so this is a cross-section test, not a genuine historical walk-forward test. ' +
+        'A curve that fits one day\u2019s market can still be wrong about the next one \u2014 treat every implied value as an estimate with a wide range, not a price.',
+    }),
   );
 }
 
@@ -124,6 +305,12 @@ function fillFilters() {
   const chains = [...new Set(ROWS.flatMap((r) => r.chains))].sort();
   const chainSel = document.getElementById('f-chain');
   for (const c of chains) chainSel.append(el('option', { value: c, text: c }));
+}
+
+function sortRatio(row) {
+  const r = curveRatio(row.tvl_usd);
+  if (Number.isFinite(r)) return r;
+  return Number.isFinite(row.ratio) ? row.ratio : 0;
 }
 
 function visibleRows() {
@@ -145,6 +332,8 @@ function visibleRows() {
       cmp = tierOrder[a.tier] - tierOrder[b.tier];
     } else if (state.sort === 'change_7d') {
       cmp = (a.change_7d ?? -Infinity) - (b.change_7d ?? -Infinity);
+    } else if (state.sort === 'ratio') {
+      cmp = sortRatio(a) - sortRatio(b);
     } else {
       cmp = a[state.sort] - b[state.sort];
     }
@@ -164,6 +353,8 @@ function renderBoard() {
   document.getElementById('board-empty').hidden = rows.length !== 0;
   for (const r of rows) {
     const change = el('td', { class: 'num ' + (r.change_7d === null ? '' : r.change_7d >= 0 ? 'up' : 'down'), text: fmtPct(r.change_7d) });
+    const ratio = sortRatio(r);
+    const ratioText = CURVE || Number.isFinite(r.ratio) ? ratio.toFixed(3) : '\u2014';
     const confBar = el('span', { class: 'conf-bar' }, [el('i', {})]);
     confBar.firstChild.style.width = r.confidence + '%';
     const tr = el('tr', {}, [
@@ -179,6 +370,7 @@ function renderBoard() {
       ]),
       el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
       change,
+      el('td', { class: 'num ratio', text: ratioText }),
       el('td', { class: 'num implied', text: fmtUsd(r.implied_value_usd) }),
       el('td', { class: 'num' }, [el('span', { class: 'conf' }, [confBar, document.createTextNode(String(r.confidence))])]),
       el('td', {}, [el('span', { class: 'tier ' + r.tier, text: r.tier })]),
@@ -201,7 +393,16 @@ function renderDetail(row) {
   const host = document.getElementById('detail-view');
   host.textContent = '';
   const recomputed = impliedOf(row);
-  const agrees = recomputed === row.implied_value_usd;
+  const diff = Math.abs(recomputed - row.implied_value_usd);
+  const agrees = diff === 0;
+  const close = !agrees && diff <= Math.max(1, row.implied_value_usd * 0.001);
+  const agreesText = agrees
+    ? ' \u2014 the same number board.json carries.'
+    : close
+      ? ' \u2014 within rounding of the number board.json carries.'
+      : ' \u2014 which differs from board.json: the data would be stale.';
+  const ratio = curveRatio(row.tvl_usd);
+  const ratioText = Number.isFinite(ratio) ? ratio.toFixed(3) : Number.isFinite(row.ratio) ? row.ratio.toFixed(3) : '\u2014';
   const facts = [
     ['TVL (snapshot)', fmtFull(row.tvl_usd)],
     ['TVL change, 7 days', fmtPct(row.change_7d)],
@@ -212,10 +413,45 @@ function renderDetail(row) {
     ['Tier', row.tier + (row.in_watchlist ? ' \u00B7 on the house watchlist' : ' \u00B7 below the watchlist floor')],
     ['Confidence', row.confidence + ' / 100'],
   ];
-  const formula =
-    fmtFull(row.tvl_usd) + ' TVL  x  ' + row.ratio.toFixed(3) + ' peer ratio  x  ' +
-    growthFactor(row.change_7d).toFixed(3) + ' momentum  x  ' + maturityFactor(row.age_days).toFixed(3) +
-    ' track record  x  ' + breadthFactor(row.chains.length).toFixed(2) + ' breadth';
+  const formula = fmtFull(row.tvl_usd) + ' TVL  x  ' + ratioText + ' curve ratio';
+  const curveLine = CURVE
+    ? 'curve ratio = exp(' + CURVE.a.toFixed(3) + ' + ' + CURVE.b.toFixed(3) + ' \u00D7 ln(TVL)), fitted on ' +
+      (CURVE.n ? CURVE.n + ' launched protocols' : 'the snapshot\u2019s launched protocols') + ' in the sealed snapshot.'
+    : 'curve ratio read from the board data.';
+  // Fitted range, display-only: the row's low/high from the model, or the
+  // implied value divided / multiplied by the validation range factor.
+  const vDetail = validationData();
+  let rangeFactor = vDetail && Number.isFinite(vDetail.range_factor) ? vDetail.range_factor : null;
+  if (rangeFactor === null && Number.isFinite(row.implied_high) && row.implied_value_usd > 0) {
+    rangeFactor = row.implied_high / row.implied_value_usd;
+  }
+  const rangeN = (vDetail && vDetail.loo && vDetail.loo.n) || (CURVE && CURVE.n) || null;
+  const rangeLow = Number.isFinite(row.implied_low)
+    ? row.implied_low
+    : rangeFactor
+      ? Math.max(1, Math.round(row.implied_value_usd / rangeFactor))
+      : null;
+  const rangeHigh = Number.isFinite(row.implied_high)
+    ? row.implied_high
+    : rangeFactor
+      ? Math.round(row.implied_value_usd * rangeFactor)
+      : null;
+  const rangeLine =
+    rangeFactor && rangeLow !== null && rangeHigh !== null
+      ? el('p', {
+          class: 'check-line',
+          text:
+            'Fitted range ' + fmtFull(rangeLow) + ' \u2013 ' + fmtFull(rangeHigh) + ' \u2014 80% of the ' + rangeN +
+            ' held-out launches landed within \u00D7' + rangeFactor.toFixed(2) + ' of the curve value.',
+        })
+      : null;
+  const recomputeLine = el('p', { class: 'check-line' }, [
+    'This page recomputes the value from the curve and gets ',
+    el('b', { text: fmtFull(recomputed) }),
+    document.createTextNode(agreesText),
+  ]);
+  const outsideRange =
+    CURVE && Number.isFinite(CURVE.tvlMin) && Number.isFinite(CURVE.tvlMax) && (row.tvl_usd < CURVE.tvlMin || row.tvl_usd > CURVE.tvlMax);
   const card = el('div', { class: 'detail-card' }, [
     el('div', { class: 'detail-head' }, [
       el('div', {}, [
@@ -232,11 +468,26 @@ function renderDetail(row) {
     el('div', { class: 'fact-grid' }, facts.map(([k, v]) => el('div', { class: 'fact' }, [el('span', { text: k }), el('b', { text: v })]))),
     el('h3', { text: 'Where the number comes from' }),
     el('div', { class: 'formula' }, [formula + '   ', el('span', { class: 'eq', text: '= ' + fmtFull(row.implied_value_usd) })]),
+    ...(rangeLine ? [rangeLine] : []),
+    el('p', { class: 'check-line', text: curveLine }),
+    ...(outsideRange
+      ? [
+          el('p', {
+            class: 'extrap',
+            text:
+              'Outside the TVL range the curve was fitted on (' + fmtUsd(CURVE.tvlMin) + '\u2013' + fmtUsd(CURVE.tvlMax) +
+              '): this value extrapolates the curve, so treat it with extra caution.',
+          }),
+        ]
+      : []),
     el('p', {
       class: 'check-line',
       text:
-        'Peer ratio: the ' + row.ratio_basis + '. This page recomputes the value from the model and gets ',
+        'Context, not priced in: 7-day TVL change ' + fmtPct(row.change_7d) + ', tokenless for ' + fmtAge(row.age_days) + ', ' +
+        row.chains.length + ' chain' + (row.chains.length === 1 ? '' : 's') +
+        ' \u2014 momentum, track record and breadth were tested and dropped (see the validation panel).',
     }),
+    recomputeLine,
     el('h3', { text: 'How to farm it' }),
     el('ol', { class: 'steps' }, row.farm_steps.map((s) => el('li', { text: s }))),
     el('p', {
@@ -244,7 +495,6 @@ function renderDetail(row) {
       text: 'Farming is positioning, not a promise: a protocol may never issue a token, and capital placed in it carries the protocol\u2019s own risks.',
     }),
   ]);
-  card.querySelector('.check-line').append(el('b', { text: fmtFull(recomputed) }), document.createTextNode(agrees ? ' \u2014 the same number board.json carries.' : ' \u2014 which differs from board.json: the data would be stale.'));
   const back = el('button', { class: 'back', text: '\u2190 Back to the board' });
   back.addEventListener('click', () => {
     location.hash = '#/';
@@ -324,7 +574,9 @@ document.querySelectorAll('thead th').forEach((th) => {
 });
 window.addEventListener('hashchange', route);
 
-renderStats();
+renderKpis();
+renderMethod();
+renderValidation();
 fillFilters();
 applyHashFilters();
 renderBoard();
